@@ -97,7 +97,7 @@ class HunyuanVideoPipeline(BasePipeline):
         ])
 
         semantic_image_pixel_values = [ref_image_transform(semantic_image) for semantic_image in semantic_images]
-        semantic_image_pixel_values = torch.cat(semantic_image_pixel_values).unsqueeze(0).unsqueeze(2).to(self.device)
+        semantic_image_pixel_values = torch.stack(semantic_image_pixel_values).unsqueeze(2).to(self.device)
         target_height, target_width = closest_size
         return semantic_image_pixel_values, target_height, target_width
 
@@ -136,6 +136,7 @@ class HunyuanVideoPipeline(BasePipeline):
         negative_prompt="",
         input_video=None,
         input_images=None,
+        middle_frame_position=16,
         i2v_resolution="720p",
         i2v_stability=True,
         denoising_strength=1.0,
@@ -156,6 +157,7 @@ class HunyuanVideoPipeline(BasePipeline):
     ):
         # Tiler parameters
         tiler_kwargs = {"tile_size": tile_size, "tile_stride": tile_stride}
+        latent_len = (num_frames - 1) // 4 + 1
 
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength)
@@ -179,7 +181,14 @@ class HunyuanVideoPipeline(BasePipeline):
         elif input_images is not None and i2v_stability:
             noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=rand_device, dtype=image_latents.dtype).to(self.device)
             t = torch.tensor([0.999]).to(device=self.device)
-            latents = noise * t + image_latents.repeat(1, 1, (num_frames - 1) // 4 + 1, 1, 1) * (1 - t)
+            if len(input_images) == 2:                
+                fraction_per_img = [latent_len // 2, latent_len - (latent_len // 2)]
+                latents = noise * t + torch.cat([image_latents[i:i+1].repeat(1, 1, fraction_per_img[i], 1, 1) for i in range(2)], dim=2) * (1 - t)
+            elif len(input_images) == 3:
+                fraction_per_img = [latent_len // 3, latent_len // 3, latent_len - (2 * (latent_len // 3))]
+                latents = noise * t + torch.cat([image_latents[i:i+1].repeat(1, 1, fraction_per_img[i], 1, 1) for i in range(3)], dim=2) * (1 - t)
+            else:
+                latents = noise * t + image_latents.repeat(1, 1, (num_frames - 1) // 4 + 1, 1, 1) * (1 - t)
             latents = latents.to(dtype=image_latents.dtype)
         else:
             latents = noise
@@ -205,14 +214,27 @@ class HunyuanVideoPipeline(BasePipeline):
 
             forward_func = lets_dance_hunyuan_video
             if input_images is not None:
-                latents = torch.concat([image_latents, latents[:, :, 1:, :, :]], dim=2)
+                if len(input_images) == 1:
+                    latents = torch.concat([image_latents, latents[:, :, 1:, :, :]], dim=2)
+                elif len(input_images) == 2:
+                    latents = torch.concat([image_latents[0:1], latents[:, :, 1:-1, :, :], image_latents[1:2]], dim=2)
+                elif len(input_images) == 3:
+                    latents = torch.concat(
+                        [
+                            image_latents[0:1],
+                            latents[:, :, 1:middle_frame_position, :, :],
+                            image_latents[1:2],
+                            latents[:, :, middle_frame_position+1:-1, :, :],
+                            image_latents[2:3],
+                        ], dim=2
+                    )
                 forward_func = lets_dance_hunyuan_video_i2v
 
             # Inference
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
-                noise_pred_posi = forward_func(self.dit, latents, timestep, **prompt_emb_posi, **extra_input, **tea_cache_kwargs)
+                noise_pred_posi = forward_func(self.dit, latents, timestep, len(input_images), middle_frame_position, **prompt_emb_posi, **extra_input, **tea_cache_kwargs)
                 if cfg_scale != 1.0:
-                    noise_pred_nega = forward_func(self.dit, latents, timestep, **prompt_emb_nega, **extra_input)
+                    noise_pred_nega = forward_func(self.dit, latents, timestep, len(input_images), middle_frame_position, **prompt_emb_nega, **extra_input)
                     noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
                 else:
                     noise_pred = noise_pred_posi
@@ -233,8 +255,27 @@ class HunyuanVideoPipeline(BasePipeline):
 
             # Scheduler
             if input_images is not None:
-                latents = self.scheduler.step(noise_pred[:, :, 1:, :, :], self.scheduler.timesteps[progress_id], latents[:, :, 1:, :, :])
-                latents = torch.concat([image_latents, latents], dim=2)
+                if len(input_images) == 1:
+                    latents = self.scheduler.step(noise_pred[:, :, 1:, :, :], self.scheduler.timesteps[progress_id], latents[:, :, 1:, :, :])
+                    latents = torch.concat([image_latents, latents], dim=2)
+                elif len(input_images) == 2:
+                    latents = torch.concat(
+                        [
+                            image_latents[0:1],
+                            self.scheduler.step(noise_pred[:, :, 1:-1, :, :], self.scheduler.timesteps[progress_id], latents[:, :, 1:-1, :, :]),
+                            image_latents[1:2],
+                        ], dim=2
+                    )
+                elif len(input_images) == 3:
+                    latents = torch.concat(
+                        [
+                            image_latents[0:1],
+                            self.scheduler.step(noise_pred[:, :, 1:middle_frame_position, :, :], self.scheduler.timesteps[progress_id], latents[:, :, 1:middle_frame_position, :, :]),
+                            image_latents[1:2],
+                            self.scheduler.step(noise_pred[:, :, middle_frame_position+1:-1, :, :], self.scheduler.timesteps[progress_id], latents[:, :, middle_frame_position+1:-1, :, :]),
+                            image_latents[2:3],
+                        ], dim=2
+                    )
             else:
                 latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
 
@@ -344,6 +385,8 @@ def lets_dance_hunyuan_video_i2v(
     dit: HunyuanVideoDiT,
     x: torch.Tensor,
     t: torch.Tensor,
+    n_images: int,
+    middle_frame_position: int = None,
     prompt_emb: torch.Tensor = None,
     text_mask: torch.Tensor = None,
     pooled_prompt_emb: torch.Tensor = None,
@@ -362,7 +405,15 @@ def lets_dance_hunyuan_video_i2v(
     vec = vec + dit.guidance_in(guidance * 1000., dtype=torch.bfloat16)
 
     token_replace_vec = dit.time_in(torch.zeros_like(t), dtype=torch.bfloat16)
-    tr_token = (H // 2) * (W // 2)
+    tr_tokens = [(0, (H // 2) * (W // 2))]
+    if n_images == 2:
+        tr_tokens.append(((H // 2) * (W // 2) * (T - 1), (H // 2) * (W // 2) * T))
+    if n_images == 3:
+        assert middle_frame_position is not None, "please provide `middle_frame_position` for `lets_dance_hunyuan_video_i2v`"
+        tr_tokens.extend([
+            ((H // 2) * (W // 2) * middle_frame_position, (H // 2) * (W // 2) * (middle_frame_position + 1)),
+            ((H // 2) * (W // 2) * (T - 1), (H // 2) * (W // 2) * T)
+        ])
     token_replace_vec = token_replace_vec + vec_2
 
     img = dit.img_in(x)
@@ -381,11 +432,11 @@ def lets_dance_hunyuan_video_i2v(
         split_token = int(text_mask.sum(dim=1))
         txt_len = int(txt.shape[1])
         for block in tqdm(dit.double_blocks, desc="Double stream blocks"):
-            img, txt = block(img, txt, vec, (freqs_cos, freqs_sin), token_replace_vec, tr_token, split_token)
+            img, txt = block(img, txt, vec, (freqs_cos, freqs_sin), token_replace_vec, tr_tokens, split_token)
 
         x = torch.concat([img, txt], dim=1)
         for block in tqdm(dit.single_blocks, desc="Single stream blocks"):
-            x = block(x, vec, (freqs_cos, freqs_sin), txt_len, token_replace_vec, tr_token, split_token)
+            x = block(x, vec, (freqs_cos, freqs_sin), txt_len, token_replace_vec, tr_tokens, split_token)
         img = x[:, :-txt_len]
 
         if tea_cache is not None:

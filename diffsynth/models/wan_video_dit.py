@@ -23,7 +23,56 @@ try:
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     
-    
+from visualizer import get_local
+
+@get_local('attn_weight_image')
+# This is only for attention weight visualizing.
+# Modified from https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+# Efficient implementation equivalent to the following:
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    # assert L == S, f"query and key should have the same length, but got L:{L} and S:{S}."
+    num_frames = 8  # TODO: get_num_frames()
+    _, ST, dim = query.shape
+    spatial_dim = ST / num_frames
+    spatial_dim = int(spatial_dim)
+    query_image = rearrange(
+        query, "B (T S) C -> (B S) T C", T=num_frames, S=spatial_dim, C=dim
+    )
+    if L == S:
+        key_image = rearrange(key, "B (T S) C -> (B S) T C", T=num_frames, S=spatial_dim, C=dim)
+    else:
+        key_image = key.repeat([spatial_dim, 1, 1])
+    attn_weight_image = query_image @ key_image.transpose(-2, -1) * scale_factor
+    attn_weight_image = torch.softmax(attn_weight_image, dim=-2)
+    # attn_weight_image = torch.dropout(attn_weight_image, dropout_p, train=True)
+
+    # attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    # attn_weight += attn_bias
+    # attn_weight = torch.softmax(attn_weight, dim=-1)
+    # attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight_image # attn_weight @ value
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -143,6 +192,13 @@ class SelfAttention(nn.Module):
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v)
+
+        attn_weight_image = scaled_dot_product_attention(
+            q.to(torch.float32), 
+            k.to(torch.float32), 
+            v.to(torch.float32)
+        )
+
         return self.o(x)
 
 
@@ -169,8 +225,10 @@ class CrossAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         if self.has_image_input:
-            img = y[:, :257]
-            ctx = y[:, 257:]
+            # img = y[:, :257]
+            # ctx = y[:, 257:]
+            img = y[:, :514]  # TODO: Fix this
+            ctx = y[:, 514:]
         else:
             ctx = y
         q = self.norm_q(self.q(x))

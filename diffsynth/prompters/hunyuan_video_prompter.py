@@ -37,6 +37,28 @@ PROMPT_TEMPLATE_ENCODE_VIDEO_I2V = (
     "<|start_header_id|>assistant<|end_header_id|>\n\n"
 )
 
+PROMPT_TEMPLATE_ENCODE_VIDEO_I2V_2FRAMES = (
+    "<|start_header_id|>system<|end_header_id|>\n\n<image><image>\nDescribe the video by detailing the following aspects according to the reference image: "
+    "1. The main content and theme of the video."
+    "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects."
+    "3. Actions, events, behaviors temporal relationships, physical movement changes of the objects."
+    "4. background environment, light, style and atmosphere."
+    "5. camera angles, movements, and transitions used in the video:<|eot_id|>\n\n"
+    "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+)
+
+PROMPT_TEMPLATE_ENCODE_VIDEO_I2V_3FRAMES = (
+    "<|start_header_id|>system<|end_header_id|>\n\n<image><image><image>\nDescribe the video by detailing the following aspects according to the reference image: "
+    "1. The main content and theme of the video."
+    "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects."
+    "3. Actions, events, behaviors temporal relationships, physical movement changes of the objects."
+    "4. background environment, light, style and atmosphere."
+    "5. camera angles, movements, and transitions used in the video:<|eot_id|>\n\n"
+    "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+)
+
 PROMPT_TEMPLATE = {
     "dit-llm-encode": {
         "template": PROMPT_TEMPLATE_ENCODE,
@@ -60,6 +82,22 @@ PROMPT_TEMPLATE = {
         "image_emb_start": 5,
         "image_emb_end": 581,
         "image_emb_len": 576,
+        "double_return_token_id": 271
+    },
+    "dit-llm-encode-video-2i2v": {
+        "template": PROMPT_TEMPLATE_ENCODE_VIDEO_I2V_2FRAMES,
+        "crop_start": 103+1,
+        "image_emb_start": 5,
+        "image_emb_end": 5+576*2,
+        "image_emb_len": 576*2,
+        "double_return_token_id": 271
+    },
+    "dit-llm-encode-video-3i2v": {
+        "template": PROMPT_TEMPLATE_ENCODE_VIDEO_I2V_3FRAMES,
+        "crop_start": 103+2,
+        "image_emb_start": 5,
+        "image_emb_end": 5+576*3,
+        "image_emb_len": 576*3,
         "double_return_token_id": 271
     },
 }
@@ -176,7 +214,7 @@ class HunyuanVideoPrompter(BasePrompter):
                                                 hidden_state_skip_layer=hidden_state_skip_layer,
                                                 pixel_values=image_outputs)
 
-        text_crop_start = (crop_start - 1 + self.prompt_template_video.get("image_emb_len", 576))
+        text_crop_start = (crop_start - len(images) + self.prompt_template_video.get("image_emb_len", 576))
         image_crop_start = self.prompt_template_video.get("image_emb_start", 5)
         image_crop_end = self.prompt_template_video.get("image_emb_end", 581)
         batch_indices, last_double_return_token_indices = torch.where(
@@ -185,13 +223,13 @@ class HunyuanVideoPrompter(BasePrompter):
             # in case the prompt is too long
             last_double_return_token_indices = torch.cat((
                 last_double_return_token_indices,
-                torch.tensor([input_ids.shape[-1]]),
+                torch.tensor([input_ids.shape[-1]], device=last_double_return_token_indices.device),
             ))
-            batch_indices = torch.cat((batch_indices, torch.tensor([0])))
+            batch_indices = torch.cat((batch_indices, torch.tensor([0], device=batch_indices.device)))
         last_double_return_token_indices = (last_double_return_token_indices.reshape(input_ids.shape[0], -1)[:, -1])
         batch_indices = batch_indices.reshape(input_ids.shape[0], -1)[:, -1]
-        assistant_crop_start = (last_double_return_token_indices - 1 + self.prompt_template_video.get("image_emb_len", 576) - 4)
-        assistant_crop_end = (last_double_return_token_indices - 1 + self.prompt_template_video.get("image_emb_len", 576))
+        assistant_crop_start = (last_double_return_token_indices - len(images) + self.prompt_template_video.get("image_emb_len", 576) - 4)
+        assistant_crop_end = (last_double_return_token_indices - len(images) + self.prompt_template_video.get("image_emb_len", 576))
         attention_mask_assistant_crop_start = (last_double_return_token_indices - 4)
         attention_mask_assistant_crop_end = last_double_return_token_indices
         text_last_hidden_state = []
@@ -247,6 +285,11 @@ class HunyuanVideoPrompter(BasePrompter):
                       image_embed_interleave=4):
 
         prompt = self.process_prompt(prompt, positive=positive)
+        if images is not None:
+            if len(images) == 2:
+                self.prompt_template_video = PROMPT_TEMPLATE["dit-llm-encode-video-2i2v"]
+            elif len(images) == 3:
+                self.prompt_template_video = PROMPT_TEMPLATE["dit-llm-encode-video-3i2v"]
 
         # apply template
         if use_template:

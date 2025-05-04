@@ -284,9 +284,34 @@ class ModulateDiT(torch.nn.Module):
 
 def modulate(x, shift=None, scale=None, tr_shift=None, tr_scale=None, tr_token=None):
     if tr_shift is not None:
-        x_zero = x[:, :tr_token] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
-        x_orig = x[:, tr_token:] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        x = torch.concat((x_zero, x_orig), dim=1)
+        assert tr_token is not None
+        if len(tr_token) ==1:
+            tr_token = tr_token[0][1]  # (H // 2) * (W // 2)
+            x_zero = x[:, :tr_token] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_orig = x[:, tr_token:] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            x = torch.concat((x_zero, x_orig), dim=1)
+        elif len(tr_token) == 2:
+            x_zero_0 = x[:, tr_token[0][0]:tr_token[0][1]] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_zero_1 = x[:, tr_token[1][0]:tr_token[1][1]] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_orig = x[:, tr_token[0][1]:tr_token[1][0]] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            x_new = torch.concat((x_zero_0, x_orig, x_zero_1), dim=1)
+            if x_new.shape[1] != x.shape[1]:
+                x_left = x[:, tr_token[1][1]:] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                x = torch.concat((x_new, x_left), dim=1)
+            else:
+                x = x_new
+        elif len(tr_token) == 3:
+            x_zero_0 = x[:, tr_token[0][0]:tr_token[0][1]] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_zero_1 = x[:, tr_token[1][0]:tr_token[1][1]] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_zero_2 = x[:, tr_token[2][0]:tr_token[2][1]] * (1 + tr_scale.unsqueeze(1)) + tr_shift.unsqueeze(1)
+            x_orig_0 = x[:, tr_token[0][1]:tr_token[1][0]] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            x_orig_1 = x[:, tr_token[1][1]:tr_token[2][0]] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            x_new = torch.concat((x_zero_0, x_orig_0, x_zero_1, x_orig_1, x_zero_2), dim=1)
+            if x_new.shape[1] != x.shape[1]:
+                x_left = x[:, tr_token[2][1]:] * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                x = torch.concat((x_new, x_left), dim=1)
+            else:
+                x = x_new
         return x
     if scale is None and shift is None:
         return x
@@ -393,9 +418,35 @@ def attention(q, k, v):
 
 def apply_gate(x, gate, tr_gate=None, tr_token=None):
     if tr_gate is not None:
-        x_zero = x[:, :tr_token] * tr_gate.unsqueeze(1)
-        x_orig = x[:, tr_token:] * gate.unsqueeze(1)
-        return torch.concat((x_zero, x_orig), dim=1)
+        assert tr_token is not None
+        if len(tr_token) ==1:
+            tr_token = tr_token[0][1]  # (H // 2) * (W // 2)
+            x_zero = x[:, :tr_token] * tr_gate.unsqueeze(1)
+            x_orig = x[:, tr_token:] * gate.unsqueeze(1)
+            x = torch.concat((x_zero, x_orig), dim=1)
+        elif len(tr_token) == 2:
+            x_zero_0 = x[:, tr_token[0][0]:tr_token[0][1]] * tr_gate.unsqueeze(1)
+            x_zero_1 = x[:, tr_token[1][0]:tr_token[1][1]] * tr_gate.unsqueeze(1)
+            x_orig = x[:, tr_token[0][1]:tr_token[1][0]] * gate.unsqueeze(1)
+            x_new = torch.concat((x_zero_0, x_orig, x_zero_1), dim=1)
+            if x_new.shape[1] != x.shape[1]:
+                x_left = x[:, tr_token[1][1]:] * gate.unsqueeze(1)
+                x = torch.concat((x_new, x_left), dim=1)
+            else:
+                x = x_new
+        elif len(tr_token) == 3:
+            x_zero_0 = x[:, tr_token[0][0]:tr_token[0][1]] * tr_gate.unsqueeze(1)
+            x_zero_1 = x[:, tr_token[1][0]:tr_token[1][1]] * tr_gate.unsqueeze(1)
+            x_zero_2 = x[:, tr_token[2][0]:tr_token[2][1]] * tr_gate.unsqueeze(1)
+            x_orig_0 = x[:, tr_token[0][1]:tr_token[1][0]] * gate.unsqueeze(1)
+            x_orig_1 = x[:, tr_token[1][1]:tr_token[2][0]] * gate.unsqueeze(1)
+            x_new = torch.concat((x_zero_0, x_orig_0, x_zero_1, x_orig_1, x_zero_2), dim=1)
+            if x_new.shape[1] != x.shape[1]:
+                x_left = x[:, tr_token[2][1]:] * gate.unsqueeze(1)
+                x = torch.concat((x_new, x_left), dim=1)
+            else:
+                x = x_new
+        return x
     else:
         return x * gate.unsqueeze(1)
 

@@ -203,26 +203,90 @@ class WanVideoPipeline(BasePipeline):
         return {"context": prompt_emb}
     
     
-    def encode_image(self, image, end_image, num_frames, height, width, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        image = self.preprocess_image(image.resize((width, height))).to(self.device)
-        clip_context = self.image_encoder.encode_image([image])
-        msk = torch.ones(1, num_frames, height//8, width//8, device=self.device)
-        msk[:, 1:] = 0
-        if end_image is not None:
-            end_image = self.preprocess_image(end_image.resize((width, height))).to(self.device)
-            vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
-            if self.dit.has_image_pos_emb:
-                clip_context = torch.concat([clip_context, self.image_encoder.encode_image([end_image])], dim=1)
-            msk[:, -1:] = 1
+    def encode_image(self, images, middle_frame_mask, middle_frame_position, num_frames, height, width, tiled=False, tile_size=(34, 34), tile_stride=(18, 16), combine_embeds="concat"):
+        print(f"Detected {len(images)} input images.")
+        images = [self.preprocess_image(img.resize((width, height))).to(self.device) for img in images]
+        
+        if len(images) == 1:
+            clip_context_input = images[0]
         else:
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+            clip_context_input = torch.cat([images[0], images[-1]], dim=0)
+        clip_context = self.image_encoder.encode_image([clip_context_input])
+        msk = torch.ones(1, num_frames, height//8, width//8, device=self.device)
 
-        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        if clip_context.shape[0] > 1:
+            if combine_embeds == "average":
+                clip_context = torch.mean(clip_context, dim=0, keepdim=True)
+            elif combine_embeds == "sum":
+                clip_context = torch.sum(clip_context, dim=0, keepdim=True)
+            elif combine_embeds == "concat":
+                clip_context = torch.cat([clip_context[0:1], clip_context[1:2]], dim=1)
+
+        # condition on start frame:
+        if len(images) == 1:
+            msk[:, 1:] = 0
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            vae_input = torch.concat([images[0].transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(images[0].device)], dim=1)
+            y = self.vae.encode([vae_input.to(dtype=self.torch_dtype, device=self.device)], device=self.device)[0]
+
+        # condition on start and end frames:
+        elif len(images) == 2:
+            msk = torch.ones(1, num_frames, height//8, width//8, device=self.device)
+            msk[:, 1:-1] = 0
+            first_frame_repeated = torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1)
+            last_frame_repeated = torch.repeat_interleave(msk[:, -1:], repeats=4, dim=1)
+            msk = torch.concat([first_frame_repeated, msk[:, 1:-1], last_frame_repeated], dim=1)
+            vae_input = torch.concat([
+                images[0].transpose(0, 1),
+                torch.zeros(3, num_frames - 2, height, width).to(images[0].device),
+                images[1].transpose(0, 1),
+            ], dim=1)
+            y = self.vae.encode([vae_input.to(dtype=self.torch_dtype, device=self.device)], end_=True, device=self.device)[0]
+
+        # condition on start, middle and end frames:
+        elif len(images) == 3:
+            msk[:, 1: 1+4*middle_frame_position] = 0  # 1:41 (40 frames) when middle_frame_position == 10
+            msk[:, 2+4*middle_frame_position:-1] = 0  # 42:82 (40 frames) when middle_frame_position == 10
+            # msk[:, 1:-1] = 0
+            first_frame_repeated = torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1)  # 1, 4, h/8, w/8
+            if middle_frame_mask is not None:
+                mid_mask = torch.tensor(
+                    np.array(
+                        middle_frame_mask.resize((width//8, height//8)),
+                        dtype=np.uint8
+                    ) // 255, dtype=torch.float32
+                ).unsqueeze(0).unsqueeze(0).to(self.device)  # 1, 1, h/8, w/8
+                mid_mask_unscaled = torch.tensor(
+                    np.array(
+                        middle_frame_mask.resize((width, height)),
+                        dtype=np.uint8
+                    ) // 255, dtype=torch.float32
+                ).unsqueeze(0).unsqueeze(0).to(self.device)  # 1, 1, h, w
+
+                images[1] = images[1] * mid_mask_unscaled
+                middle_frame_repeated = torch.repeat_interleave(mid_mask, repeats=4, dim=1)
+            else:
+                middle_frame_repeated = torch.repeat_interleave(msk[:, 1+4*middle_frame_position:2+4*middle_frame_position], repeats=4, dim=1)
+            last_frame_repeated = torch.repeat_interleave(msk[:, -1:], repeats=4, dim=1)
+            msk = torch.concat([
+                first_frame_repeated,  # 4
+                msk[:, 1:1+4*middle_frame_position],  # 40
+                middle_frame_repeated,  # 4
+                msk[:, 2+4*middle_frame_position:-1],  # 40
+                last_frame_repeated  # 4
+            ], dim=1)
+            vae_input = torch.concat([
+                images[0].transpose(0, 1),  
+                torch.zeros(3, 4*middle_frame_position, height, width).to(images[0].device),
+                images[1].transpose(0, 1),
+                torch.zeros(3, num_frames-3-4*middle_frame_position, height, width).to(images[0].device),
+                images[2].transpose(0, 1),
+            ], dim=1)
+            y = self.vae.encode([vae_input.to(dtype=self.torch_dtype, device=self.device)], mid_end_=True, middle_frame_position=middle_frame_position, device=self.device)[0]
+        
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
         
-        y = self.vae.encode([vae_input.to(dtype=self.torch_dtype, device=self.device)], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
-        y = y.to(dtype=self.torch_dtype, device=self.device)
         y = torch.concat([msk, y])
         y = y.unsqueeze(0)
         clip_context = clip_context.to(dtype=self.torch_dtype, device=self.device)
@@ -265,11 +329,11 @@ class WanVideoPipeline(BasePipeline):
         return latents
     
     
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+    def decode_video(self, latents, middle_frame_position=10, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+        frames = self.vae.decode(latents, device=self.device, middle_frame_position=10, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
-    
-    
+
+
     def prepare_unified_sequence_parallel(self):
         return {"use_unified_sequence_parallel": self.use_unified_sequence_parallel}
     
@@ -329,14 +393,30 @@ class WanVideoPipeline(BasePipeline):
         else:
             return latents, {"vace_context": None, "vace_scale": vace_scale}
 
+    def resize_to_width(self, image: Image.Image, target_width: int = 832):
+        original_width, original_height = image.size
+        scale_ratio = target_width / original_width        
+        target_height = int(original_height * scale_ratio)
+
+        if target_height % self.height_division_factor != 0:
+            target_height = (target_height + self.height_division_factor - 1) // self.height_division_factor * self.height_division_factor
+            print(f"The height cannot be evenly divided by {self.height_division_factor}. We round it up to {target_height}.")
+        if target_width % self.width_division_factor != 0:
+            target_width = (target_width + self.width_division_factor - 1) // self.width_division_factor * self.width_division_factor
+            print(f"The width cannot be evenly divided by {self.width_division_factor}. We round it up to {target_width}.")
+
+        resized_image = image.resize((target_width, target_height))
+        
+        return resized_image, target_height, target_width
 
     @torch.no_grad()
     def __call__(
         self,
         prompt,
         negative_prompt="",
-        input_image=None,
-        end_image=None,
+        input_images=None,
+        middle_frame_mask=None,
+        middle_frame_position=5,  # 10 means the middle
         input_video=None,
         control_video=None,
         vace_video=None,
@@ -361,20 +441,41 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
     ):
+        input_images[0], height, width = self.resize_to_width(input_images[0], width)
+        if len(input_images) == 2:
+            input_images[-1] = input_images[-1].resize((width, height))
+        if len(input_images) == 3:
+            input_images[-1] = input_images[-1].resize((width, height))
+            input_images[1] = input_images[1].resize((width, height))
+            if middle_frame_mask is not None:
+                middle_frame_mask = middle_frame_mask.resize((width, height))
+
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
-        if num_frames % 4 != 1:
+        if num_frames % 4 != 1 and len(input_images) == 1:
             num_frames = (num_frames + 2) // 4 * 4 + 1
-            print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
+            print(f"Only `num_frames % 4 != 1` is acceptable for 1 input image. We round it up to {num_frames}.")
+        if num_frames % 4 != 2 and len(input_images) == 2:
+            num_frames = (num_frames + 2) // 4 * 4 + 2
+            print(f"Only `num_frames % 4 != 2` is acceptable for 2 input images. We round it up to {num_frames}.")
+        if num_frames % 4 != 3 and len(input_images) == 3:
+            num_frames = (num_frames + 2) // 4 * 4 + 3
+            print(f"Only `num_frames % 4 != 3` is acceptable for 3 input images. We round it up to {num_frames}.")
         
         # Tiler parameters
-        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
+        if len(input_images) == 2:
+            kwargs = {"end_": True}
+        elif len(input_images) == 3:
+            kwargs = {"mid_end_": True}
+        else: 
+            kwargs = {}
+        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride, **kwargs}
 
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
         # Initialize noise
-        noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=rand_device, dtype=torch.float32)
+        noise = self.generate_noise((1, 16, (num_frames - len(input_images)) // 4 + len(input_images), height//8, width//8), seed=seed, device=rand_device, dtype=torch.float32)
         noise = noise.to(dtype=self.torch_dtype, device=self.device)
         if input_video is not None:
             self.load_models_to_device(['vae'])
@@ -384,7 +485,7 @@ class WanVideoPipeline(BasePipeline):
             latents = self.scheduler.add_noise(latents, noise, timestep=self.scheduler.timesteps[0])
         else:
             latents = noise
-        
+
         # Encode prompts
         self.load_models_to_device(["text_encoder"])
         prompt_emb_posi = self.encode_prompt(prompt, positive=True)
@@ -392,12 +493,12 @@ class WanVideoPipeline(BasePipeline):
             prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False)
             
         # Encode image
-        if input_image is not None and self.image_encoder is not None:
+        if input_images is not None and self.image_encoder is not None:
             self.load_models_to_device(["image_encoder", "vae"])
-            image_emb = self.encode_image(input_image, end_image, num_frames, height, width, **tiler_kwargs)
+            image_emb = self.encode_image(input_images, middle_frame_mask, middle_frame_position, num_frames, height, width, **tiler_kwargs)
         else:
             image_emb = {}
-            
+
         # ControlNet
         if control_video is not None:
             self.load_models_to_device(["image_encoder", "vae"])
@@ -408,20 +509,20 @@ class WanVideoPipeline(BasePipeline):
             motion_kwargs = self.prepare_motion_bucket_id(motion_bucket_id)
         else:
             motion_kwargs = {}
-            
+                 
         # Extra input
         extra_input = self.prepare_extra_input(latents)
-        
+
         # VACE
         latents, vace_kwargs = self.prepare_vace_kwargs(
             latents, vace_video, vace_video_mask, vace_reference_image, vace_scale,
             height=height, width=width, num_frames=num_frames, seed=seed, rand_device=rand_device, **tiler_kwargs
         )
-        
+
         # TeaCache
         tea_cache_posi = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None else None}
         tea_cache_nega = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None else None}
-        
+
         # Unified Sequence Parallel
         usp_kwargs = self.prepare_unified_sequence_parallel()
 
@@ -450,13 +551,13 @@ class WanVideoPipeline(BasePipeline):
 
             # Scheduler
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
-            
+
         if vace_reference_image is not None:
             latents = latents[:, :, 1:]
 
         # Decode
         self.load_models_to_device(['vae'])
-        frames = self.decode_video(latents, **tiler_kwargs)
+        frames = self.decode_video(latents, middle_frame_position, **tiler_kwargs)
         self.load_models_to_device([])
         frames = self.tensor2video(frames[0])
 
@@ -538,7 +639,7 @@ def model_fn_wan_video(
         from xfuser.core.distributed import (get_sequence_parallel_rank,
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
-    
+
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
     if motion_bucket_id is not None and motion_controller is not None:
@@ -563,7 +664,7 @@ def model_fn_wan_video(
         tea_cache_update = tea_cache.check(dit, x, t_mod)
     else:
         tea_cache_update = False
-        
+
     if vace_context is not None:
         vace_hints = vace(x, vace_context, context, t_mod, freqs)
     
